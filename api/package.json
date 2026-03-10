@@ -1,0 +1,24 @@
+{
+  "name": "shopify-middleware",
+  "version": "1.0.0",
+  "private": true
+}
+```
+
+---
+
+## Vercel'e Deploy
+
+1. Bu 3 dosyayı GitHub'a ekleyin (`shopify-middleware` reposu)
+2. Vercel → Import → Deploy (environment variable eklemeye gerek yok, URL kod içinde)
+3. Deploy sonrası URL'yi alın: `https://shopify-middleware-xxxxx.vercel.app`
+
+---
+
+## Shopify Webhook'ları Güncelleme
+
+**Shopify Admin → Settings → Notifications → Webhooks**
+
+Mevcut 4 webhook'un URL'sini değiştirin. Hepsinde aynı URL:
+```
+https://SIZIN-VERCEL-URL.vercel.app/api/webhook
