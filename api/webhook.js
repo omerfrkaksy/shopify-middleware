@@ -54,6 +54,10 @@ function findProvinceFromAddress(address) {
   return null;
 }
 
+function isProvince(str) {
+  return str && ILLER[normalize(str)] ? true : false;
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -62,59 +66,73 @@ export default async function handler(req, res) {
   try {
     var order = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     if (!order || !order.id) {
-      return res.status(200).json({ skipped: true, reason: "Gecersiz veri" });
+      return res.status(200).json({ skipped: true });
     }
 
     var addr = order.shipping_address;
     if (!addr) {
-      // Adres yoksa direkt webhook'a ilet
       await forwardToWebhook(req, order);
-      return res.status(200).json({ success: true, method: "webhook-no-address" });
+      return res.status(200).json({ success: true, method: "webhook" });
     }
 
-    // IL DUZELTME
+    // ORIJINAL DEGERLER
     var origProvince = addr.province || "";
     var origCity = addr.city || "";
+
+    // IL DUZELTME
     var fixedProvince = fixProvince(origProvince);
 
-    // Province bos veya bulunamadiysa city'den dene
-    if (!ILLER[normalize(fixedProvince)]) {
+    if (!isProvince(fixedProvince)) {
       var fromCity = fixProvince(origCity);
-      if (ILLER[normalize(fromCity)]) {
-        fixedProvince = fromCity;
-      }
+      if (isProvince(fromCity)) fixedProvince = fromCity;
     }
 
-    // Hala bulunamadiysa adres metninden ara
-    if (!ILLER[normalize(fixedProvince)]) {
+    if (!isProvince(fixedProvince)) {
       var fullText = [addr.address1, addr.address2, origCity, origProvince].join(" ");
       var found = findProvinceFromAddress(fullText);
       if (found) fixedProvince = found;
     }
 
-    // ILCE DUZELTME - city aslinda il ise swap yap
+    // ILCE DUZELTME
     var fixedCity = origCity;
-    if (ILLER[normalize(origCity)] && !ILLER[normalize(origProvince)]) {
+
+    // City aslinda il ise swap
+    if (isProvince(origCity) && !isProvince(origProvince)) {
       fixedProvince = ILLER[normalize(origCity)];
       fixedCity = origProvince;
     }
 
-    // Il ve ilce ayni ise ilceyi address2'den al
-    if (normalize(fixedProvince) === normalize(fixedCity) && addr.address2) {
-      fixedCity = addr.address2;
+    // Ilce il ile ayni veya ilce de bir il adiysa -> bos say
+    if (isProvince(fixedCity) || normalize(fixedProvince) === normalize(fixedCity)) {
+      fixedCity = "";
+    }
+
+    // Ilce bossa address2'den dene
+    if (!fixedCity && addr.address2) {
+      if (!isProvince(addr.address2)) {
+        fixedCity = addr.address2;
+      }
+    }
+
+    // Hala bossa "Merkez" yaz (ShopPanel bos kabul etmiyor)
+    if (!fixedCity) {
+      fixedCity = "Merkez";
     }
 
     var needsFix = (fixedProvince !== origProvince) || (fixedCity !== origCity);
 
-    console.log("Siparis:", order.name, "| Il:", origProvince, "->", fixedProvince, "| Ilce:", origCity, "->", fixedCity, "| Duzeltme:", needsFix);
+    console.log("Siparis:", order.name,
+      "| Il:", origProvince, "->", fixedProvince,
+      "| Ilce:", origCity, "->", fixedCity,
+      "| Fix:", needsFix);
 
-    if (!needsFix || ILLER[normalize(origProvince)]) {
-      // Duzeltme gerekmiyorsa veya il zaten dogru ise webhook ile gonder
+    // Il zaten dogru VE ilce de dolu ise webhook ile gonder
+    if (isProvince(origProvince) && origCity && !isProvince(origCity) && origCity !== origProvince) {
       await forwardToWebhook(req, order);
-      return res.status(200).json({ success: true, method: "webhook-no-fix-needed" });
+      return res.status(200).json({ success: true, method: "webhook" });
     }
 
-    // DUZELTME GEREKIYOR - ShopPanel API ile siparis olustur
+    // DUZELTME GEREKIYOR - ShopPanel API ile
     var APIKEY = process.env.SHOPPANEL_API_KEY;
 
     var phone = addr.phone || order.phone || "";
@@ -122,10 +140,6 @@ export default async function handler(req, res) {
     if (phone.startsWith("+90")) phone = "0" + phone.slice(3);
     if (!phone.startsWith("0") && phone.length === 10) phone = "0" + phone;
 
-    var customerName = (addr.first_name || "") + " " + (addr.last_name || "");
-    customerName = customerName.trim() || "Musteri";
-
-    // Odeme durumu
     var gateway = (order.gateway || "").toLowerCase();
     var financialStatus = order.financial_status || "";
     var isCOD = gateway.includes("cash") || gateway.includes("cod") || gateway.includes("kapida") || gateway.includes("manual") || financialStatus === "pending";
@@ -162,7 +176,7 @@ export default async function handler(req, res) {
       note: "Shopify #" + (order.name || order.order_number || order.id)
     };
 
-    console.log("ShopPanel API ile siparis olusturuluyor:", orderData.note);
+    console.log("API ile gonderiliyor:", JSON.stringify(orderData).substring(0, 300));
 
     var apiResponse = await fetch(SHOPPANEL_API + "/orders", {
       method: "POST",
@@ -176,44 +190,25 @@ export default async function handler(req, res) {
     var apiResult = await apiResponse.text();
     console.log("ShopPanel API yanit:", apiResponse.status, apiResult.substring(0, 500));
 
-    // Eger API 409 (duplicate) dondururse, siparis zaten var demek - sorun yok
     if (apiResponse.status === 409) {
-      console.log("Siparis zaten mevcut, atlanıyor");
       return res.status(200).json({ success: true, method: "api-duplicate" });
     }
 
-    return res.status(200).json({
-      success: apiResponse.ok,
-      method: "api",
-      shoppanelStatus: apiResponse.status
-    });
+    return res.status(200).json({ success: apiResponse.ok, method: "api", status: apiResponse.status });
 
   } catch (err) {
-    console.error("Middleware hatasi:", err);
+    console.error("Hata:", err);
     return res.status(200).json({ success: false, error: err.message });
   }
 }
 
-// Orijinal webhook'a iletme (duzeltme gerekmeyenler icin)
 async function forwardToWebhook(req, order) {
   var headers = { "Content-Type": "application/json" };
-  var shopifyHeaders = [
-    "x-shopify-topic", "x-shopify-shop-domain", "x-shopify-hmac-sha256",
-    "x-shopify-api-version", "x-shopify-webhook-id"
-  ];
-  for (var i = 0; i < shopifyHeaders.length; i++) {
-    if (req.headers[shopifyHeaders[i]]) {
-      headers[shopifyHeaders[i]] = req.headers[shopifyHeaders[i]];
-    }
+  var hList = ["x-shopify-topic","x-shopify-shop-domain","x-shopify-hmac-sha256","x-shopify-api-version","x-shopify-webhook-id"];
+  for (var i = 0; i < hList.length; i++) {
+    if (req.headers[hList[i]]) headers[hList[i]] = req.headers[hList[i]];
   }
-
-  await fetch(SHOPPANEL_WEBHOOK, {
-    method: "POST",
-    headers: headers,
-    body: JSON.stringify(order)
-  });
+  await fetch(SHOPPANEL_WEBHOOK, { method: "POST", headers: headers, body: JSON.stringify(order) });
 }
 
-export const config = {
-  api: { bodyParser: true }
-};
+export const config = { api: { bodyParser: true } };
